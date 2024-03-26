@@ -3,6 +3,9 @@
 
 #include "Arduino.h"
 #include <vector>
+#include <queue>
+#include <tuple>
+#include <functional>
 
 const int kNumOfGaitPhases = 2;             // number of gait phases in a gait cycle
 const int kNumOfActuationPhases = 3;        // number of actuation phases in swing
@@ -17,6 +20,15 @@ enum ActuationPhases {
     kLocomote = 1,
     kTouchDown = 2
 };
+
+enum ReactiveBehaviors {
+    kStancePosition = 0,    // a reactive behavior involving stance legs in position control
+    kStanceTorque = 1,      // a reactive behavior involving stance legs in torque control
+    kSwingPosition = 2,     // a reactive behavior involving swing legs in position control
+    kSwingTorque = 3        // a reactive behavior involving swing legs in torque control
+};
+
+typedef std::tuple<uint8_t, ReactiveBehaviors, std::function<void(uint8_t)>> MotionPrimitives;
 
 // touchdown torque profile parameters
 const float kDqLegStartup = 10;         // leg touchdown displacement after which a lower torque is applied
@@ -33,12 +45,13 @@ const float k_zBodyMax = 300;           // maximum allowable value for z_body_lo
 const float kLegSwingPercentMax = 0.9;
 const float kLegSwingPercentMin = 0.2;
 
-// blocking motion primitive parameters
-const float kDzSoftMax = 30;            // body height deviation in mm above which non-blocking regulation is executed
-const float kDzHardMax = 60;            // body height deviation in mm above which blocking regulation is executed
+// motion primitive parameters
+const float kDqSwingLegClearance = 10;  // swing leg vertical clearance margin when performing body height or tilt regulation; assumes flat terrain; adjust accordingly
+const float kQTransCentered = 20;       // distance from translational joint midpoint within which non-blocking motion primitives are allowed; used to ensure stable support boundary
+const float k_zErrorSoftMax = 30;       // body height deviation in mm above which non-blocking regulation is executed
+const float k_zErrorHardMax = 60;       // body height deviation in mm above which blocking regulation is executed
 const float kTiltNominal = 3;           // acceptable body tilt from zero in degrees
 const float kDqLegMaxTilt = 100;        // max total leg displacements per tilt correction
-const float kOmegaStable = 5;           // lateral body angular velocity value in deg/s below which the blocking of normal gait behavior ends
 const float kQdotStable = 15;           // leg motor velocity in mm/s below which the blocking of normal gait behavior ends
 
 // motor torque setpoints during leg touchdown; determined heuristically
@@ -56,8 +69,8 @@ extern std::vector<float> cmd_vector;   // command vector: {forward-back, yaw an
 extern uint8_t gait_phase;              // current gait phase; (0 medial swing/lateral stance) -> (1 medial stance/lateral swing); double support is omitted
 extern uint8_t actuation_phase;         // current actuation phase of the swing legs; 0 retract -> 1 translate -> 2 touchdown
 extern uint32_t gait_cycles;            // number of completed gait cycles
-extern bool isBlocking;                 // true if any motion primitive outside of the standard gait cycle is in progress
-extern bool isCorrected;                // true if a motion primitive has been completed during the gait cycle
+extern bool isBlocking;                 // true if a blocking motion primitive is ongoing
+extern std::queue<MotionPrimitives> mp_queue;
 
 // nominal leg trajectory parameters; can be updated by a high-level planner
 // exact trajectory is determined by the motor controller's trapezoidal trajectory generation: acceleration, deceleration, max velocity
@@ -77,24 +90,27 @@ void updateTrajectory();
 
 void regulateBodyPose();
 
+bool isFinishedReacting(uint8_t motor_group, uint8_t behavior);
+
 bool isReadyForTransition(uint8_t phase);
 
 void updateSetpoints();
 
-void updateLegMotorsForTouchdown();
-
-void updateTouchdownTorque();
-
-// update and/or reset swing/stance setpoints based on last contact conditions
-void updateSwingLegSetpoints();
-
-// update the motor control mode and limits for swing phase
-void updateLegMotorsForSwing();
-
-void updateLegMotorsForStance();
-
 void moveLocomotionMechanism();
 
 void holdLocomotionMechanism();
+
+void updateMotorsTouchdown();
+
+void updateTouchdownTorque();
+
+// updates the specified stance body's leg motors for zero torque stance, leveraging the non-backdrivable legs
+void updateMotorsStance(uint8_t stance);
+
+// update the specified stance body's leg motors to move by dz
+void updateMotorsClimb(uint8_t stance, float dz);
+
+// determine swing leg setpoints based on contact conditions and update the motor control mode and limits for swing phase
+void updateMotorsSwing();
 
 #endif

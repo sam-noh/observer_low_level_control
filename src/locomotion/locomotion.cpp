@@ -17,7 +17,7 @@ uint8_t gait_phase = GaitPhases::kLateralSwing;         // current gait phase/sw
 uint8_t actuation_phase = ActuationPhases::kRetractLeg; // current actuation phase of the swing legs; 0 retract -> 1 translate -> 2 touchdown
 uint32_t gait_cycles = 0;                               // number of completed gait cycles
 bool isBlocking = false;                                // true if any motion primitive outside of the standard gait cycle is in progress
-bool isCorrected = false;                               // true if a motion primitive has been completed during the gait cycle
+std::queue<MotionPrimitives> mp_queue;
 
 // nominal leg trajectory parameters; can be updated by a high-level planner
 // exact trajectory is determined by the motor controller's trapezoidal trajectory generation: acceleration, deceleration, max velocity
@@ -38,10 +38,10 @@ void homeLeggedRobot() {
   writeToSerial();
 
   // leg actuator homing
-  for (uint8_t axis_id = 0; axis_id < kNumOfLegs/2; ++axis_id) {
-    motors[axis_id].states_.current_limit = kCurrentLegMaxHoming;
-    motors[axis_id].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kVelocityControl;
-    motors[axis_id].states_.q_dot_d = kQdotLegHoming;
+  for (uint8_t idx_motor = 0; idx_motor < kNumOfLegs/2; ++idx_motor) {
+    motors[idx_motor].states_.current_limit = kCurrentLegMaxHoming;
+    motors[idx_motor].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kVelocityControl;
+    motors[idx_motor].states_.q_dot_d = kQdotLegHoming;
   }
 
   bool moving[4] = {true, true, true, true};
@@ -53,23 +53,23 @@ void homeLeggedRobot() {
     updateStates();
     updateMotorCommands();
 
-    for (uint8_t axis_id = 0; axis_id < kNumOfLegs/2; ++axis_id) {
+    for (uint8_t idx_motor = 0; idx_motor < kNumOfLegs/2; ++idx_motor) {
       // if the motor has slowed down, it's at the joint limit
-      if (moving[axis_id] && millis() - t_current > 1000 && fabs(motors[axis_id].states_.q_dot) < fabs(kQdotLegHomingStop)) {
-        moving[axis_id] = false;
+      if (moving[idx_motor] && millis() - t_current > 1000 && fabs(motors[idx_motor].states_.q_dot) < fabs(kQdotLegHomingStop)) {
+        moving[idx_motor] = false;
         
-        motors[axis_id].states_.q_dot_d = 0;
-        motors[axis_id].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kPositionControl;
-        motors[axis_id].states_.trap_traj_vel_limit = kVelLegTrajStandup;
-        motors[axis_id].states_.current_limit = kCurrentLegMax;
+        motors[idx_motor].states_.q_dot_d = 0;
+        motors[idx_motor].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kPositionControl;
+        motors[idx_motor].states_.trap_traj_vel_limit = kVelLegTrajStandup;
+        motors[idx_motor].states_.current_limit = kCurrentLegMax;
                 
-        motors[axis_id].states_.homed = true;
-        motors[axis_id].states_.pos_home = motors[axis_id].states_.pos_abs;
-        motors[axis_id].states_.pos_rel = motors[axis_id].states_.pos_abs - motors[axis_id].states_.pos_home;
-        encoders[axis_id*2].write(0);
-        encoders[axis_id*2 + 1].write(0);
+        motors[idx_motor].states_.homed = true;
+        motors[idx_motor].states_.pos_home = motors[idx_motor].states_.pos_abs;
+        motors[idx_motor].states_.pos_rel = motors[idx_motor].states_.pos_abs - motors[idx_motor].states_.pos_home;
+        encoders[idx_motor*2].write(0);
+        encoders[idx_motor*2 + 1].write(0);
         
-        snprintf(sent_data, sizeof(sent_data), "Actuator %d homed.\n******************************************************\n", axis_id + 1);
+        snprintf(sent_data, sizeof(sent_data), "Actuator %d homed.\n******************************************************\n", idx_motor + 1);
         writeToSerial();
       }
     }
@@ -89,9 +89,10 @@ void homeLeggedRobot() {
   writeToSerial();
 
   uint8_t stance = (gait_phase + 1) % kNumOfGaitPhases;
-  motors[stance*2].states_.q_d = 40;
-  motors[stance*2 + 1].states_.q_d = 40;
-
+  isInContact[stance*2] = true;
+  isInContact[stance*2 + 1] = true;
+  updateMotorsClimb(stance, kDqLegLift);
+  
   t_current = millis();
   while (millis() - t_current < 500 || (fabs(motors[stance*2].states_.q_dot) > fabs(kQdotLegHomingStop)
                                         && fabs(motors[stance*2 + 1].states_.q_dot) > fabs(kQdotLegHomingStop))) {
@@ -193,13 +194,7 @@ void standUp() {
   writeToSerial();
   
   uint8_t stance = (gait_phase + 1) % kNumOfGaitPhases;
-
-  for (uint8_t axis_id = stance*2; axis_id < stance*2 + 2; ++axis_id) {
-    motors[axis_id].states_.q_d = z_body_nominal;
-    motors[axis_id].states_.holding = false;
-    motors[axis_id].states_.trap_traj_vel_limit = kVelLegTrajStandup;
-    isInContact[axis_id] = true;
-  }
+  updateMotorsClimb(stance, z_body_nominal - kDqLegLift);
 
   // update states while standing up
   while (!motors[stance * 2].states_.holding && !motors[stance * 2 + 1].states_.holding) {
@@ -208,11 +203,7 @@ void standUp() {
     updateMotorCommands();
   }
 
-  for (uint8_t axis_id = stance*2; axis_id < stance*2 + 2; ++axis_id) {
-    motors[axis_id].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kTorqueControl;
-    motors[axis_id].states_.tau_d = 0;                          // zero out torque command
-    motors[axis_id].sendCommand(ODriveTeensyCAN::ControlMode_t::kTorqueControl, motors[axis_id].states_.tau_d);
-  }
+  updateMotorsStance(stance);
   
   snprintf(sent_data, sizeof(sent_data), "Starting\n");
   writeToSerial();
@@ -252,46 +243,52 @@ void updateTrajectory() {
 // executes body orientation and height regulation that blocks normal gait cycle
 void regulateBodyPose() {
 
-  if (!isBlocking) {    // only check body pose if currently not performing a regulation maneuver
+  if (mp_queue.size() == 0) {    // only allow motion primitives when there is none at the moment
 
-    // nominal body height regulation (blocking)
-    if (actuation_phase == ActuationPhases::kTouchDown                                    // if currently touching down
-        && isInContact[gait_phase * 2] && isInContact[gait_phase * 2 + 1]                 // AND the swing legs are now also on the ground
-        && fabs(z_body_local - z_body_nominal) > kDzSoftMax                               // AND the body height is not within nominal range
-        && fabs(rpy_lateral[0]) < kTiltNominal && fabs(rpy_lateral[1]) < kTiltNominal) {  // AND the body tilt is within nominal range
+    uint8_t stance = (gait_phase + 1) % kNumOfGaitPhases;
+    float z_error = z_body_local - z_body_nominal;
+    float dq = stance_width[gait_phase] * tan(rpy_lateral[gait_phase] * DEG2RAD);
 
-      // perform the body height regulation maneuver
-      float dz_body_local = z_body_local - z_body_nominal;
+    // body height regulation
+    if (fabs(z_error) > k_zErrorSoftMax                                                   // if there is height error
+        && fabs(rpy_lateral[0]) < kTiltNominal && fabs(rpy_lateral[1]) < kTiltNominal) {  // AND the body tilt is small
 
-      for (uint8_t axis_id = 0; axis_id < kNumOfLegs/2; ++axis_id) {
-        // put leg motors in position control for the maneuver
-        motors[axis_id].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kPositionControl;
+      // non-blocking motion: only performed during swing phase and for small height error
+      if (actuation_phase == ActuationPhases::kLocomote                                     // if leg retraction is complete
+          && fabs(z_error) < k_zErrorHardMax                                                // AND height error is small
+          && fabs(z_error) + kDqSwingLegClearance < (q_leg_contact[0] - q_leg_swing[0])     // AND there is sufficient swing leg clearance (assumes flat terrain)
+          && fabs(motors[MotorID::kMotorTranslate].states_.q) < kQTransCentered) {          // AND the translational joint is near the midpoint
+            
+        // move stance legs
+        updateMotorsClimb(stance, -z_error);
 
-        // adjust velocity, acceleration, deceleration limits for trapezoidal trajectory during this maneuver
-        motors[axis_id].states_.trap_traj_vel_limit = kVelLegTrajStandup;
-        motors[axis_id].states_.trap_traj_accel_limit = kAccelLegTrajStandup;
-        motors[axis_id].states_.trap_traj_decel_limit = kDecelLegTrajStandup;
-        
-        // move all leg motors by dz_body_local
-        motors[axis_id].states_.q_d = motors[axis_id].states_.q - dz_body_local;
+        // add this motion primitive to the queue
+        mp_queue.push(std::make_tuple(stance, ReactiveBehaviors::kStancePosition, updateMotorsStance));
       }
 
-      isBlocking = true;
-      isCorrected = true;
+      // blocking motion: only performed during double stance and for large height error
+      if (actuation_phase == ActuationPhases::kTouchDown                                    // if currently touching down
+          && fabs(z_error) > k_zErrorHardMax                                                // AND height error is large
+          && isInContact[gait_phase * 2] && isInContact[gait_phase * 2 + 1]) {              // AND the swing legs are now also on the ground (double stance)
 
-    // nominal body tilt regulation (non-blocking)
-    } else if (actuation_phase == ActuationPhases::kLocomote                      // if currently translating or turning
-               && fabs(rpy_lateral[gait_phase]) > kTiltNominal                    // AND the body tilt is not within nominal range
-               && fabs(motors[MotorID::kMotorTranslate].states_.q) < 20) {        // AND the translational joint is near the midpoint
+        // move double stance legs
+        updateMotorsClimb(GaitPhases::kMedialSwing, -z_error);
+        updateMotorsClimb(GaitPhases::kLateralSwing, -z_error);
 
-      uint8_t stance = (gait_phase + 1) % kNumOfGaitPhases;
-      float dq = stance_width[gait_phase] * tan(rpy_lateral[gait_phase] * PI / 180);
-      if (dq > kDqLegMaxTilt) {
-        dq = kDqLegMaxTilt;
+        // add this motion primitive to the queue
+        mp_queue.push(std::make_tuple(0, ReactiveBehaviors::kStancePosition, updateMotorsStance));
+        mp_queue.push(std::make_tuple(1, ReactiveBehaviors::kStancePosition, updateMotorsStance));
+        isBlocking = true;
       }
-      if (dq < -kDqLegMaxTilt) {
-        dq = -kDqLegMaxTilt;
-      }
+
+    // body tilt regulation
+    } else if (actuation_phase == ActuationPhases::kLocomote                            // if currently translating or turning
+               && fabs(rpy_lateral[gait_phase]) > kTiltNominal                          // AND the body tilt is not within nominal range
+               && fabs(dq) + kDqSwingLegClearance < (q_leg_contact[0] - q_leg_swing[0]) // AND there is sufficient swing leg clearance (assumes flat terrain)
+               && fabs(motors[MotorID::kMotorTranslate].states_.q) < kQTransCentered) { // AND the translational joint is near the midpoint
+
+      if (dq > kDqLegMaxTilt) dq = kDqLegMaxTilt;
+      if (dq < -kDqLegMaxTilt) dq = -kDqLegMaxTilt;
 
       for (uint8_t i = 0; i < 2; ++i) {
         // put leg motors in position control for the maneuver
@@ -305,24 +302,31 @@ void regulateBodyPose() {
         // move opposite leg motors
         motors[stance * 2 + i].states_.q_d = motors[stance * 2 + i].states_.q + pow(-1, i)*dq / 2;
       }
-      
-      isBlocking = true;
-      isCorrected = true;
+
+      mp_queue.push(std::make_tuple(stance, ReactiveBehaviors::kStancePosition, updateMotorsStance));
      }
 
 
-  } else if (isBlocking                                                                                         // if the body pose regulation is currently happening
-             && fabs(motors[0].states_.q_dot) < kQdotStable && fabs(motors[1].states_.q_dot) < kQdotStable      // AND all leg motor velocities are below a threshold
-             && fabs(motors[2].states_.q_dot) < kQdotStable && fabs(motors[3].states_.q_dot) < kQdotStable) {
-
-    isBlocking = false;
-    
-    for(uint8_t axis_id = 0; axis_id < kNumOfLegs/2; ++axis_id) {
-      motors[axis_id].states_.trap_traj_vel_limit = kVelLegTrajSwing;
-      motors[axis_id].states_.trap_traj_accel_limit = kAccelLegTrajSwing;
-      motors[axis_id].states_.trap_traj_decel_limit = kDecelLegTrajSwing;
+  } else {
+    MotionPrimitives mp = mp_queue.front();
+    while (mp_queue.size() > 0 && isFinishedReacting(std::get<0>(mp), std::get<1>(mp))) {
+      std::function<void(uint8_t)> callback = std::get<2>(mp);
+      callback(std::get<0>(mp));
+      mp_queue.pop();
+      if (actuation_phase == ActuationPhases::kTouchDown) isBlocking = false;
+      if (mp_queue.size() > 0) {
+        mp = mp_queue.front();
+      }
     }
+  }
+}
 
+bool isFinishedReacting(uint8_t motor_group, uint8_t behavior) {
+  if (behavior == ReactiveBehaviors::kStancePosition) {
+    return motors[motor_group*2].states_.holding && motors[motor_group*2 + 1].states_.holding;
+
+  } else {
+    return false;
   }
 }
 
@@ -380,14 +384,11 @@ void updateSetpoints() {
       }
 
     } else if (actuation_phase == ActuationPhases::kLocomote) { // if currently translating or turning
-      updateLegMotorsForTouchdown();
+      updateMotorsTouchdown();
       moveLocomotionMechanism();      // reapply locomotion mechanism setpoints in the case of resuming locomotion from standstill
       
     } else if (actuation_phase == ActuationPhases::kTouchDown) {        // if currently touching down
-      // clear these flags/variables for the next gait cycle
-      isCorrected = false;
-
-      updateLegMotorsForStance();
+      updateMotorsStance(gait_phase);
 
       // advance the gait phase
       gait_phase = (gait_phase + 1) % kNumOfGaitPhases;
@@ -395,8 +396,7 @@ void updateSetpoints() {
         gait_cycles++; // if the gait phase is back to 0, increment the number of completed gait cycles
       }
 
-      updateSwingLegSetpoints();
-      updateLegMotorsForSwing();
+      updateMotorsSwing();
       resetSwingLegContactState();
     }
 
@@ -408,83 +408,16 @@ void updateSetpoints() {
       
     } else if (actuation_phase == ActuationPhases::kLocomote) {     // if currently translating or turning
       
-      if (fabs(cmd_vector[0]) < EPS && fabs(cmd_vector[1]) < EPS) {   // if no translation or yaw command
+      if (fabs(cmd_vector[0]) < EPS && fabs(cmd_vector[1]) < EPS) { // if no translation or yaw command
         holdLocomotionMechanism();
 
-      } else {  // else, move according to the current command
+      } else {                                                      // else, move according to the current command
         moveLocomotionMechanism();
       }
       
     } else if (actuation_phase == ActuationPhases::kTouchDown) {    // if currently touching down
       updateTouchdownTorque();
-      updateLegMotorsForStance();
-    }
-  }
-}
-
-void updateLegMotorsForTouchdown() {
-  for (uint8_t axis_id = gait_phase*2; axis_id < gait_phase*2 + 2; ++axis_id) {
-    motors[axis_id].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kTorqueControl; // change to torque control for leg touchdown
-    motors[axis_id].states_.velocity_limit = kVelLegMaxContact;                         // limit velocity in torque control during touchdown
-    motors[axis_id].states_.tau_d = touchdown_torque[axis_id][0];                       // set torque command for leg touchdown
-  }
-}
-
-void updateTouchdownTorque() {
-  for (uint8_t i = 0; i < 2; ++i) {
-    if (!isInContact[gait_phase*2 + i]) {  // if the motor is not in contact
-      if ((motors[gait_phase*2 + i].states_.q  - q_leg_swing[i]) > kDqLegStartup) {     // if past the startup displacement
-        motors[gait_phase*2 + i].states_.tau_d = touchdown_torque[gait_phase*2 + i][1]; // lower the leg torque
-      }
-
-      if ((motors[gait_phase*2 + i].states_.q - q_leg_swing[i]) > kDqLegRamp) {         // if past the ramp up displacement
-        motors[gait_phase*2 + i].states_.tau_d = touchdown_torque[gait_phase*2 + i][2]; // lower the leg torque
-      }
-    }
-  }
-}
-
-// update and/or reset swing/stance setpoints based on last contact conditions
-void updateSwingLegSetpoints() {
-  for (uint8_t i = 0; i < 2; i++) {
-
-    q_leg_contact[i] = motors[gait_phase*2 + i].states_.q;      // remember the leg motor position at ground contact
-    float q_leg_retract = q_leg_contact[i]*leg_swing_percent;   // nominal swing leg setpoint; NOT necessarily equal to the actual setpoint
-
-    // TODO: change this logic to account for robot kinematics (body tilt)
-    if (fabs(q[gait_phase * 4 + i * 2] - q[gait_phase * 4 + i * 2 + 1]) > kDqUnevenTerrain) { // if the previous stance legs are standing on uneven ground
-      float q_max = max(q[gait_phase * 4 + i * 2], q[gait_phase * 4 + i * 2 + 1]);            // calculate the additional leg stroke due to uneven terrain
-      float dq = q_max - motors[gait_phase * 2 + i].states_.q;
-      
-      motors[gait_phase * 2 + i].states_.q_d = max(kQLegMin + 5, q_leg_retract - dq); // retract more by dq to ensure proper ground clearance
-
-    } else {  
-      motors[gait_phase * 2 + i].states_.q_d = q_leg_retract;  // if even terrain, use the nominal swing leg setpoint
-    }
-
-    // remember the swing leg position setpoint
-    q_leg_swing[i] = motors[gait_phase * 2 + i].states_.q_d;
-  }
-}
-
-// update the motor control mode and limits for swing phase
-void updateLegMotorsForSwing() {
-  for (uint8_t axis_id = gait_phase*2; axis_id < gait_phase*2 + 2; ++axis_id) {
-    motors[axis_id].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kPositionControl;
-    motors[axis_id].states_.holding = false;
-    motors[axis_id].states_.velocity_limit = kVelLegMax;
-    motors[axis_id].states_.trap_traj_vel_limit = kVelLegTrajSwing;
-    motors[axis_id].states_.trap_traj_accel_limit = kAccelLegTrajSwing;
-    motors[axis_id].states_.trap_traj_decel_limit = kDecelLegTrajSwing;
-  }
-}
-
-void updateLegMotorsForStance() {
-  for (uint8_t axis_id = gait_phase*2; axis_id < gait_phase*2 + 2; ++axis_id) {
-    if(isInContact[axis_id]) {
-      motors[axis_id].states_.q_d = motors[axis_id].states_.q;    // set desired position for telemetry purposes and possible control changes
-      motors[axis_id].states_.tau_d = 0;                          // zero out torque command
-      motors[axis_id].sendCommand(ODriveTeensyCAN::ControlMode_t::kTorqueControl, motors[axis_id].states_.tau_d);
+      updateMotorsStance(gait_phase);
     }
   }
 }
@@ -499,4 +432,84 @@ void moveLocomotionMechanism() {
 void holdLocomotionMechanism() {
   motors[MotorID::kMotorTranslate].states_.q_d = motors[MotorID::kMotorTranslate].states_.q;  // stop at current translation and yaw
   motors[MotorID::kMotorYaw].states_.q_d = motors[MotorID::kMotorYaw].states_.q;
+}
+
+void updateMotorsTouchdown() {
+  for (uint8_t idx_motor = gait_phase*2; idx_motor < gait_phase*2 + 2; ++idx_motor) {
+    motors[idx_motor].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kTorqueControl; // change to torque control for leg touchdown
+    motors[idx_motor].states_.velocity_limit = kVelLegMaxContact;                         // limit velocity in torque control during touchdown
+    motors[idx_motor].states_.tau_d = touchdown_torque[idx_motor][0];                       // set torque command for leg touchdown
+  }
+}
+
+void updateTouchdownTorque() {
+  for (uint8_t i = 0; i < 2; ++i) {
+    uint8_t idx_motor = gait_phase*2 + i;
+
+    // if the motor is not in contact
+    if (!isInContact[idx_motor]) {
+      if ((motors[idx_motor].states_.q  - q_leg_swing[i]) > kDqLegStartup) {  // if past the startup displacement
+        motors[idx_motor].states_.tau_d = touchdown_torque[idx_motor][1];       // lower the leg torque
+      }
+
+      if ((motors[idx_motor].states_.q - q_leg_swing[i]) > kDqLegRamp) {      // if past the ramp up displacement
+        motors[idx_motor].states_.tau_d = touchdown_torque[idx_motor][2];       // lower the leg torque
+      }
+    }
+  }
+}
+
+// updates the specified stance body's leg motors for zero torque stance, leveraging the non-backdrivable legs
+void updateMotorsStance(uint8_t stance) {
+  for (uint8_t idx_motor = stance*2; idx_motor < stance*2 + 2; ++idx_motor) {
+    if(isInContact[idx_motor]) {                                                            // safety check; cannot be in stance without being in contact
+      motors[idx_motor].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kTorqueControl; // torque control
+      motors[idx_motor].states_.tau_d = 0;                                                  // zero torque command
+      motors[idx_motor].states_.q_d = motors[idx_motor].states_.q;                          // set desired position for telemetry purposes and possible control changes
+    }
+  }
+}
+
+// update the specified stance body's leg motors to move by dz
+void updateMotorsClimb(uint8_t stance, float dz) {
+  for (uint8_t idx_motor = stance*2; idx_motor < stance*2 + 2; ++idx_motor) {
+    motors[idx_motor].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kPositionControl;
+    motors[idx_motor].states_.trap_traj_vel_limit = kVelLegTrajStandup;
+    motors[idx_motor].states_.trap_traj_accel_limit = kAccelLegTrajStandup;
+    motors[idx_motor].states_.trap_traj_decel_limit = kDecelLegTrajStandup;
+    motors[idx_motor].states_.q_d = motors[idx_motor].states_.q + dz;
+    motors[idx_motor].states_.holding = false;
+  }
+}
+
+// determine swing leg setpoints based on contact conditions and update the motor control mode and limits for swing phase
+void updateMotorsSwing() {
+  for (uint8_t i = 0; i < 2; ++i) {
+    uint8_t idx_motor = gait_phase*2 + i;
+
+    q_leg_contact[i] = motors[idx_motor].states_.q;             // remember the leg motor position at ground contact
+    float q_leg_retract = q_leg_contact[i]*leg_swing_percent;   // nominal swing leg setpoint; NOT necessarily equal to the actual setpoint
+
+    // TODO: change this logic to account for robot kinematics (body tilt)
+    if (fabs(q[gait_phase * 4 + i * 2] - q[gait_phase * 4 + i * 2 + 1]) > kDqUnevenTerrain) { // if the previous stance legs are standing on uneven ground
+      float q_max = max(q[gait_phase * 4 + i * 2], q[gait_phase * 4 + i * 2 + 1]);            // calculate the additional leg stroke due to uneven terrain
+      float dq = q_max - motors[idx_motor].states_.q;
+      
+      motors[idx_motor].states_.q_d = max(kQLegMin + 5, q_leg_retract - dq); // retract more by dq to ensure proper ground clearance
+
+    } else {  
+      motors[idx_motor].states_.q_d = q_leg_retract;  // if even terrain, use the nominal swing leg setpoint
+    }
+
+    // remember the swing leg position setpoint
+    q_leg_swing[i] = motors[idx_motor].states_.q_d;
+
+    // update the motor control mode and limits for swing phase
+    motors[idx_motor].states_.ctrl_mode = ODriveTeensyCAN::ControlMode_t::kPositionControl;
+    motors[idx_motor].states_.holding = false;
+    motors[idx_motor].states_.velocity_limit = kVelLegMax;
+    motors[idx_motor].states_.trap_traj_vel_limit = kVelLegTrajSwing;
+    motors[idx_motor].states_.trap_traj_accel_limit = kAccelLegTrajSwing;
+    motors[idx_motor].states_.trap_traj_decel_limit = kDecelLegTrajSwing;
+  }
 }
